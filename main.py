@@ -17,21 +17,23 @@ client = anthropic.Anthropic()
 
 system_prompt = """You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
 
+## Planning (MOST IMPORTANT)
+For any task with more than one or two steps, your VERY FIRST action MUST be to call TodoWrite with an initial plan — before any web_search, before any other work. This is non-negotiable.
+
+Then as you work:
+- Mark a task in_progress BEFORE starting it. Mark it completed IMMEDIATELY after finishing — never batch.
+- Only one task should be in_progress at a time.
+- When you learn something that changes the plan (a step is unnecessary, a new step is needed, the approach is wrong), call TodoWrite again with the revised list. Replanning is expected, not a failure.
+- Skip TodoWrite only for trivial single-step tasks (e.g. "what's 2+2", a single quick lookup, a direct factual question).
+
+Use your private thinking between tool calls to decide whether the plan still fits the situation.
+
+## Other tools
 Use web_search() when the user asks about current events, real-time data, or anything where your training knowledge may be outdated or insufficient. For general knowledge questions and tasks, answer directly from your knowledge unless you have reason to doubt its accuracy.
 
 Use user_input() to ask the user clarifying questions when their request is ambiguous or when you need more information to give a useful response. Use it sparingly — only ask when it genuinely helps you do a better job.
 
 When you are done with a task or the conversation has reached a natural stopping point, call job_finished() to return control to the user.
-
-## Planning
-For any task with more than one or two steps, use TodoWrite to maintain a visible plan:
-- Write the initial plan as soon as you understand the task — before doing real work.
-- Mark a task in_progress BEFORE starting it. Mark it completed IMMEDIATELY after finishing — never batch.
-- Only one task should be in_progress at a time.
-- When you learn something that changes the plan (a step is unnecessary, a new step is needed, the approach is wrong), call TodoWrite again with the revised list. Replanning is expected, not a failure.
-- Skip TodoWrite only for trivial single-step tasks (e.g. "what's 2+2", a single quick lookup).
-
-Use your private thinking between tool calls to decide whether the plan still fits the situation.
 """
 
 def read_multiline(label="User"):
@@ -178,13 +180,14 @@ def log_block(block):
 
 running = True
 turn = 0
+container_id = None
 while running:
     turn += 1
     print("\n" + "=" * 60)
-    print(f"[turn {turn}] sending {len(messages)} messages")
+    print(f"[turn {turn}] sending {len(messages)} messages" + (f" | container={container_id}" if container_id else ""))
 
     # LLM Inference
-    response = client.messages.create(
+    kwargs = dict(
         model="claude-sonnet-4-6",
         max_tokens=16000,
         system=system_prompt,
@@ -193,6 +196,12 @@ while running:
         thinking={"type": "enabled", "budget_tokens": 4000},
         extra_headers={"anthropic-beta": "interleaved-thinking-2025-05-14"},
     )
+    if container_id:
+        kwargs["container"] = container_id
+    response = client.messages.create(**kwargs)
+
+    if response.container:
+        container_id = response.container.id
 
     u = response.usage
     print(f"[stop_reason] {response.stop_reason} | [usage] in={u.input_tokens} out={u.output_tokens}")
