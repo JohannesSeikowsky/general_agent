@@ -1,0 +1,1 @@
+We are trying to make a simple version of a general purpose agent that has the fundamental powerful capabilities of agents like Claude Code, Manus and OpenAI's Deepresearch.
