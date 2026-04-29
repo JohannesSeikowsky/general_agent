@@ -8,8 +8,11 @@
 
 # Basic Research Assistant
 # LLM in a loop with tools.
+import json
 import anthropic
+from dotenv import load_dotenv
 
+load_dotenv()
 client = anthropic.Anthropic()
 
 system_prompt = """You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
@@ -31,8 +34,21 @@ For any task with more than one or two steps, use TodoWrite to maintain a visibl
 Use your private thinking between tool calls to decide whether the plan still fits the situation.
 """
 
-print("Task:\n")
-prompt = input()
+def read_multiline(label="User"):
+    """Read multi-line input from the user, terminated by an empty line."""
+    print(f"{label}: (end with an empty line)\n")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+prompt = read_multiline("Task")
 
 # Set up conversation
 messages = [
@@ -98,9 +114,7 @@ tools = [
 def user_input(message):
     """Prompt the user in the terminal and return their reply."""
     print(message)
-    print("User:\n")
-    response = input()
-    return response
+    return read_multiline("User")
 
 def job_finished():
     """Signal the main loop to stop."""
@@ -135,8 +149,40 @@ def call_function(name, args):
     elif name == "TodoWrite":
         return todo_write(args["todos"])
 
+def truncate(s, n=600):
+    """Truncate long strings for readable logs."""
+    s = s if isinstance(s, str) else json.dumps(s, default=str)
+    return s if len(s) <= n else s[:n] + f"... [+{len(s)-n} chars]"
+
+def log_block(block):
+    """Print one response block with a clear marker for dev visibility."""
+    t = block.type
+    if t == "text":
+        print(f"\n[text]\n{block.text}")
+    elif t == "thinking":
+        print(f"\n[thinking]\n{truncate(block.thinking, 1200)}")
+    elif t == "tool_use":
+        print(f"\n[tool_use] {block.name}({truncate(block.input)})")
+    elif t == "server_tool_use":
+        print(f"\n[server_tool_use] {block.name}({truncate(block.input)})")
+    elif t == "web_search_tool_result":
+        results = getattr(block, "content", [])
+        if isinstance(results, list):
+            print(f"\n[web_search_results] {len(results)} hits")
+            for i, r in enumerate(results[:5], 1):
+                print(f"  {i}. {getattr(r, 'title', '?')} — {getattr(r, 'url', '?')}")
+        else:
+            print(f"\n[web_search_results] {truncate(results)}")
+    else:
+        print(f"\n[{t}] {truncate(getattr(block, 'model_dump', lambda: block)())}")
+
 running = True
+turn = 0
 while running:
+    turn += 1
+    print("\n" + "=" * 60)
+    print(f"[turn {turn}] sending {len(messages)} messages")
+
     # LLM Inference
     response = client.messages.create(
         model="claude-sonnet-4-6",
@@ -148,20 +194,19 @@ while running:
         extra_headers={"anthropic-beta": "interleaved-thinking-2025-05-14"},
     )
 
+    u = response.usage
+    print(f"[stop_reason] {response.stop_reason} | [usage] in={u.input_tokens} out={u.output_tokens}")
+
     # Add assistant response to conversation history
     messages.append({"role": "assistant", "content": response.content})
 
     # Calling tools
     tool_results = []
     for block in response.content:
-        if block.type == "text":
-            print(block.text)
-        elif block.type == "thinking":
-            pass
-        elif block.type == "tool_use":
-            print(block.type, block.name)
+        log_block(block)
+        if block.type == "tool_use":
             result = call_function(block.name, block.input)
-            print(result)
+            print(f"[tool_result] {truncate(result)}")
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -171,7 +216,11 @@ while running:
     if tool_results and running:
         messages.append({"role": "user", "content": tool_results})
     elif response.stop_reason == "end_turn":
-        break
+        # Agent ended its turn without a tool call. Let the user reply.
+        follow_up = read_multiline("User")
+        if not follow_up.strip():
+            break
+        messages.append({"role": "user", "content": follow_up})
 
 
 
