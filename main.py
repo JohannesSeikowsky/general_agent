@@ -9,11 +9,17 @@
 # Basic Research Assistant
 # LLM in a loop with tools.
 import json
+import os
+import subprocess
 import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 client = anthropic.Anthropic()
+
+WORKING_DIR = os.getcwd()
+BASH_TIMEOUT = 120
+BASH_OUTPUT_CAP = 20_000
 
 system_prompt = """You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
 
@@ -32,6 +38,13 @@ Use your private thinking between tool calls to decide whether the plan still fi
 Use web_search() when the user asks about current events, real-time data, or anything where your training knowledge may be outdated or insufficient. For general knowledge questions and tasks, answer directly from your knowledge unless you have reason to doubt its accuracy.
 
 Use user_input() to ask the user clarifying questions when their request is ambiguous or when you need more information to give a useful response. Use it sparingly — only ask when it genuinely helps you do a better job.
+
+Use run_bash() to execute shell commands on the user's machine. Important properties of this tool:
+- Every call requires the user to MANUALLY APPROVE the exact command before it runs. You cannot run anything without their explicit consent. If the user denies a command, do NOT immediately retry the same one — adjust your approach or ask them what they'd prefer.
+- Each call spawns a fresh, INDEPENDENT shell. State does NOT persist between calls: cwd resets, environment variables are lost, activated virtualenvs deactivate, Python REPL state is gone. Files written to disk and packages installed do persist.
+- If you need state within a single operation, chain commands with && in one call, e.g. `cd /path && source myenv/bin/activate && python script.py`.
+- Be deliberate. Prefer one well-formed command that accomplishes the goal over many small commands the user has to approve one-by-one.
+- Output is truncated at ~20KB and there is a 120s timeout per command.
 
 When you are done with a task or the conversation has reached a natural stopping point, call job_finished() to return control to the user.
 """
@@ -87,6 +100,26 @@ tools = [
         }
     },
     {
+        "name": "run_bash",
+        "description": (
+            "Run a shell command on the user's machine. The user MUST manually approve every command before it runs — "
+            "if denied, the command is not executed and a denial message is returned. "
+            "Each call uses a fresh, independent shell: cwd, env vars, and activated virtualenvs do NOT persist between calls. "
+            "Chain commands with && in a single call when you need state to carry through (e.g. 'cd dir && source venv/bin/activate && python x.py'). "
+            "Output is capped at ~20KB and execution times out at 120s."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to run."
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    {
       "name": "TodoWrite",
       "description": "Create or update the structured task plan. Pass the FULL updated list each call.",
       "input_schema": {
@@ -124,6 +157,27 @@ def job_finished():
     running = False
     return ""
 
+def run_bash(command):
+    """Run a shell command after explicit user approval; returns exit code and (stdout+stderr)."""
+    print(f"\n[bash request] cwd={WORKING_DIR}")
+    print(f"  $ {command}")
+    approval = input("Approve? (y/N): ").strip().lower()
+    if approval != "y":
+        return "[denied by user] command was NOT executed. Adjust your approach or ask the user what they'd prefer."
+    try:
+        r = subprocess.run(
+            command, shell=True, cwd=WORKING_DIR,
+            capture_output=True, text=True, timeout=BASH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[timeout after {BASH_TIMEOUT}s] command was killed"
+    out = r.stdout or ""
+    if r.stderr:
+        out += ("\n[stderr]\n" + r.stderr)
+    if len(out) > BASH_OUTPUT_CAP:
+        out = out[:BASH_OUTPUT_CAP] + f"\n... [+{len(out)-BASH_OUTPUT_CAP} chars truncated]"
+    return f"[exit {r.returncode}]\n{out}"
+
 todos = []
 
 def print_todos():
@@ -150,6 +204,8 @@ def call_function(name, args):
         return job_finished(**args)
     elif name == "TodoWrite":
         return todo_write(args["todos"])
+    elif name == "run_bash":
+        return run_bash(**args)
 
 def truncate(s, n=600):
     """Truncate long strings for readable logs."""
