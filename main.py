@@ -20,6 +20,7 @@ client = anthropic.Anthropic()
 WORKING_DIR = os.getcwd()
 BASH_TIMEOUT = 120
 BASH_OUTPUT_CAP = 20_000
+FILE_READ_CAP = 10_000
 
 system_prompt = """You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
 
@@ -38,6 +39,11 @@ Use your private thinking between tool calls to decide whether the plan still fi
 Use web_search() when the user asks about current events, real-time data, or anything where your training knowledge may be outdated or insufficient. For general knowledge questions and tasks, answer directly from your knowledge unless you have reason to doubt its accuracy.
 
 Use user_input() to ask the user clarifying questions when their request is ambiguous or when you need more information to give a useful response. Use it sparingly — only ask when it genuinely helps you do a better job.
+
+Use read_file(), write_file(), and edit_file() for file system operations — prefer these over run_bash() when the task is purely reading or modifying files:
+- read_file(path, offset?, limit?) — reads a file and returns its contents with line numbers. No user approval required. Use this instead of `cat` or `head`.
+- write_file(path, content) — creates or fully overwrites a file. Requires user approval. Use this instead of `echo > file` or writing via a shell heredoc.
+- edit_file(path, old_string, new_string) — replaces an exact substring in a file. Requires user approval. Use read_file() first to get the exact text if needed. old_string must match exactly once — be more specific if it appears multiple times.
 
 Use run_bash() to execute shell commands on the user's machine. Important properties of this tool:
 - Every call requires the user to MANUALLY APPROVE the exact command before it runs. You cannot run anything without their explicit consent. If the user denies a command, do NOT immediately retry the same one — adjust your approach or ask them what they'd prefer.
@@ -120,6 +126,71 @@ tools = [
         }
     },
     {
+        "name": "read_file",
+        "description": "Read a file and return its contents with line numbers. No user approval required.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file (absolute or relative to working directory)."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from (optional)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (optional)."
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Create or fully overwrite a file with the given content. Requires user approval.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write (absolute or relative to working directory)."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full content to write to the file."
+                }
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "Replace an exact substring in a file. old_string must match exactly once — "
+            "use read_file() first to get the precise text if needed. Requires user approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to edit (absolute or relative to working directory)."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact text to find and replace. Must appear exactly once in the file."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The text to replace old_string with."
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        }
+    },
+    {
       "name": "TodoWrite",
       "description": "Create or update the structured task plan. Pass the FULL updated list each call.",
       "input_schema": {
@@ -178,6 +249,63 @@ def run_bash(command):
         out = out[:BASH_OUTPUT_CAP] + f"\n... [+{len(out)-BASH_OUTPUT_CAP} chars truncated]"
     return f"[exit {r.returncode}]\n{out}"
 
+def read_file(path, offset=None, limit=None):
+    """Return file contents with line numbers; no approval required."""
+    full_path = path if os.path.isabs(path) else os.path.join(WORKING_DIR, path)
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return f"[error] file not found: {full_path}"
+    except OSError as e:
+        return f"[error] could not read file: {e}"
+    start = (offset - 1) if offset else 0
+    end = (start + limit) if limit else len(lines)
+    selected = lines[start:end]
+    output = "".join(f"{start + i + 1}\t{line}" for i, line in enumerate(selected))
+    if len(output) > FILE_READ_CAP:
+        output = output[:FILE_READ_CAP] + f"\n... [+{len(output)-FILE_READ_CAP} chars truncated]"
+    return output
+
+def write_file(path, content):
+    """Write content to a file after user approval."""
+    full_path = path if os.path.isabs(path) else os.path.join(WORKING_DIR, path)
+    preview = content[:300] + ("..." if len(content) > 300 else "")
+    print(f"\n[write_file] {full_path}")
+    print(f"--- content preview ---\n{preview}\n-----------------------")
+    approval = input("Approve? (y/N): ").strip().lower()
+    if approval != "y":
+        return "[denied by user] file was NOT written."
+    os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+    with open(full_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return f"[ok] wrote {len(content)} chars to {full_path}"
+
+def edit_file(path, old_string, new_string):
+    """Replace old_string with new_string in a file after user approval."""
+    full_path = path if os.path.isabs(path) else os.path.join(WORKING_DIR, path)
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            original = f.read()
+    except FileNotFoundError:
+        return f"[error] file not found: {full_path}"
+    except OSError as e:
+        return f"[error] could not read file: {e}"
+    count = original.count(old_string)
+    if count == 0:
+        return "[error] old_string not found in file — use read_file() to get the exact text."
+    if count > 1:
+        return f"[error] old_string appears {count} times — be more specific so it matches exactly once."
+    print(f"\n[edit_file] {full_path}")
+    print(f"--- old ---\n{old_string}\n--- new ---\n{new_string}\n-----------")
+    approval = input("Approve? (y/N): ").strip().lower()
+    if approval != "y":
+        return "[denied by user] file was NOT modified."
+    updated = original.replace(old_string, new_string, 1)
+    with open(full_path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    return f"[ok] edit applied to {full_path}"
+
 todos = []
 
 def print_todos():
@@ -206,6 +334,12 @@ def call_function(name, args):
         return todo_write(args["todos"])
     elif name == "run_bash":
         return run_bash(**args)
+    elif name == "read_file":
+        return read_file(**args)
+    elif name == "write_file":
+        return write_file(**args)
+    elif name == "edit_file":
+        return edit_file(**args)
 
 def truncate(s, n=600):
     """Truncate long strings for readable logs."""
