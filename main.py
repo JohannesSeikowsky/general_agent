@@ -11,6 +11,7 @@
 import json
 import os
 import subprocess
+import sys
 import anthropic
 from dotenv import load_dotenv
 
@@ -22,7 +23,7 @@ BASH_TIMEOUT = 120
 BASH_OUTPUT_CAP = 20_000
 FILE_READ_CAP = 10_000
 
-system_prompt = """You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
+system_prompt = f"""You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
 
 ## Planning (MOST IMPORTANT)
 For any task with more than one or two steps, your VERY FIRST action MUST be to call TodoWrite with an initial plan — before any web_search, before any other work. This is non-negotiable.
@@ -47,8 +48,9 @@ Use read_file(), write_file(), and edit_file() for file system operations — pr
 
 Use run_bash() to execute shell commands on the user's machine. Important properties of this tool:
 - Every call requires the user to MANUALLY APPROVE the exact command before it runs. You cannot run anything without their explicit consent. If the user denies a command, do NOT immediately retry the same one — adjust your approach or ask them what they'd prefer.
-- Each call spawns a fresh, INDEPENDENT shell. State does NOT persist between calls: cwd resets, environment variables are lost, activated virtualenvs deactivate, Python REPL state is gone. Files written to disk and packages installed do persist.
-- If you need state within a single operation, chain commands with && in one call, e.g. `cd /path && source myenv/bin/activate && python script.py`.
+- Each call spawns a fresh, INDEPENDENT shell that always starts in: {WORKING_DIR}
+- State does NOT persist between calls: cwd resets to the directory above, environment variables are lost, activated virtualenvs deactivate, Python REPL state is gone. Files written to disk and packages installed do persist.
+- If you need state within a single operation, chain commands with && in one call, e.g. `cd subdir && source myenv/bin/activate && python script.py`.
 - Be deliberate. Prefer one well-formed command that accomplishes the goal over many small commands the user has to approve one-by-one.
 - Output is truncated at ~20KB and there is a 120s timeout per command.
 
@@ -230,6 +232,8 @@ def job_finished():
 
 def run_bash(command):
     """Run a shell command after explicit user approval; returns exit code and (stdout+stderr)."""
+    if not sys.stdin.isatty():
+        return "[denied] approval requires an interactive terminal; refusing to run"
     print(f"\n[bash request] cwd={WORKING_DIR}")
     print(f"  $ {command}")
     approval = input("Approve? (y/N): ").strip().lower()
@@ -269,6 +273,8 @@ def read_file(path, offset=None, limit=None):
 
 def write_file(path, content):
     """Write content to a file after user approval."""
+    if not sys.stdin.isatty():
+        return "[denied] approval requires an interactive terminal; refusing to write"
     full_path = path if os.path.isabs(path) else os.path.join(WORKING_DIR, path)
     preview = content[:300] + ("..." if len(content) > 300 else "")
     print(f"\n[write_file] {full_path}")
@@ -283,6 +289,8 @@ def write_file(path, content):
 
 def edit_file(path, old_string, new_string):
     """Replace old_string with new_string in a file after user approval."""
+    if not sys.stdin.isatty():
+        return "[denied] approval requires an interactive terminal; refusing to edit"
     full_path = path if os.path.isabs(path) else os.path.join(WORKING_DIR, path)
     try:
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
