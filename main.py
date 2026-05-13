@@ -22,6 +22,46 @@ WORKING_DIR = os.getcwd()
 BASH_TIMEOUT = 120
 BASH_OUTPUT_CAP = 20_000
 FILE_READ_CAP = 10_000
+SKILLS_DIR = os.path.join(WORKING_DIR, "skills")
+
+def parse_skill(raw):
+    """Split YAML frontmatter from body; return (description, body)."""
+    if not raw.startswith("---"):
+        return "", raw
+    _, frontmatter, body = raw.split("---", 2)
+    description = ""
+    for line in frontmatter.splitlines():
+        if line.strip().startswith("description:"):
+            description = line.split(":", 1)[1].strip()
+            break
+    return description, body.lstrip()
+
+def load_skills():
+    """Scan ./skills/*/SKILL.md and return {name: {description, body}}."""
+    found = {}
+    if not os.path.isdir(SKILLS_DIR):
+        return found
+    for entry in sorted(os.listdir(SKILLS_DIR)):
+        path = os.path.join(SKILLS_DIR, entry, "SKILL.md")
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            description, body = parse_skill(f.read())
+        found[entry] = {"description": description, "body": body}
+    return found
+
+skills = load_skills()
+
+if skills:
+    listing = "\n".join(f"- {name} — {s['description']}" for name, s in skills.items())
+    skill_block = (
+        "\n\n## Available skills\n"
+        "Call skill(name, arguments?) when a user request matches one. "
+        "The tool returns instructions for you to follow.\n"
+        f"{listing}\n"
+    )
+else:
+    skill_block = ""
 
 system_prompt = f"""You are a capable general-purpose assistant. You can answer questions, help with tasks, search the web for up-to-date information, and have back-and-forth conversations with the user.
 
@@ -55,7 +95,7 @@ Use run_bash() to execute shell commands on the user's machine. Important proper
 - Output is truncated at ~20KB and there is a 120s timeout per command.
 
 When you are done with a task or the conversation has reached a natural stopping point, call job_finished() to return control to the user.
-"""
+""" + skill_block
 
 def read_multiline(label="User"):
     """Read multi-line input from the user, terminated by an empty line."""
@@ -193,6 +233,22 @@ tools = [
         }
     },
     {
+        "name": "skill",
+        "description": (
+            "Load and run a named skill. Returns the skill body (with $ARGUMENTS substituted) — "
+            "treat the returned text as instructions to follow. "
+            "Only call this for names listed under 'Available skills' in the system prompt."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name (directory under skills/)."},
+                "arguments": {"type": "string", "description": "Optional argument string to substitute for $ARGUMENTS."}
+            },
+            "required": ["name"]
+        }
+    },
+    {
       "name": "TodoWrite",
       "description": "Create or update the structured task plan. Pass the FULL updated list each call.",
       "input_schema": {
@@ -314,6 +370,13 @@ def edit_file(path, old_string, new_string):
         f.write(updated)
     return f"[ok] edit applied to {full_path}"
 
+def run_skill(name, arguments=""):
+    """Render a skill body for the model to follow."""
+    if name not in skills:
+        available = ", ".join(skills) or "(none)"
+        return f"[error] no skill named '{name}'. Available: {available}"
+    return skills[name]["body"].replace("$ARGUMENTS", arguments)
+
 todos = []
 
 def print_todos():
@@ -348,6 +411,8 @@ def call_function(name, args):
         return write_file(**args)
     elif name == "edit_file":
         return edit_file(**args)
+    elif name == "skill":
+        return run_skill(**args)
 
 def truncate(s, n=600):
     """Truncate long strings for readable logs."""
